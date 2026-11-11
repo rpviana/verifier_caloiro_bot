@@ -7,6 +7,7 @@ const {
     ButtonBuilder,
     ButtonStyle,
     EmbedBuilder,
+    MessageFlags,
     REST,
     Routes,
     PermissionFlagsBits,
@@ -17,6 +18,10 @@ const MicrosoftStrategy = require('passport-microsoft').Strategy;
 const session = require('express-session');
 
 const app = express();
+
+// Necessário para sessões funcionarem corretamente atrás do proxy do Railway
+app.set('trust proxy', 1);
+
 const discordClient = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -165,7 +170,7 @@ discordClient.on('interactionCreate', async (interaction) => {
             content:
                 `🔗 **Clica no link abaixo** para fazeres login com a tua conta institucional da ESTG:\n${link}\n\n` +
                 `⚠️ Este link é pessoal — não o partilhes com ninguém!`,
-            ephemeral: true, // Só o utilizador que clicou vê esta mensagem
+            flags: MessageFlags.Ephemeral,
         });
         return;
     }
