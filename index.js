@@ -1,4 +1,5 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const {
     Client,
     GatewayIntentBits,
@@ -19,7 +20,7 @@ const session = require('express-session');
 
 const app = express();
 
-// Necessário para sessões funcionarem corretamente atrás do proxy do Railway
+// Necessário para sessões funcionarem atrás do proxy do Railway
 app.set('trust proxy', 1);
 
 const discordClient = new Client({
@@ -34,12 +35,39 @@ const discordClient = new Client({
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 const PORT = process.env.PORT || 3000;
 
-// ─── Sessões & Passport ───────────────────────────────────────────────────────
+// ─── Tokens temporários (substitui sessão para o discordId) ───────────────────
+// Map: token (hex aleatório) -> { discordId, expiresAt }
+// Evita problemas de sessão com reverse proxies (Railway, Render, etc.)
+const pendingVerifications = new Map();
+
+function createToken(discordId) {
+    const token = crypto.randomBytes(20).toString('hex');
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutos
+    pendingVerifications.set(token, { discordId, expiresAt });
+    setTimeout(() => pendingVerifications.delete(token), 10 * 60 * 1000);
+    return token;
+}
+
+function consumeToken(token) {
+    const entry = pendingVerifications.get(token);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+        pendingVerifications.delete(token);
+        return null;
+    }
+    pendingVerifications.delete(token); // token de uso único
+    return entry.discordId;
+}
+
+// ─── Sessão mínima (só para o passport funcionar) ────────────────────────────
 app.use(session({
     secret: process.env.SESSION_SECRET || 'fallback_dev_secret_muda_isto',
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: BASE_URL.startsWith('https') },
+    cookie: {
+        secure: BASE_URL.startsWith('https'),
+        sameSite: BASE_URL.startsWith('https') ? 'none' : 'lax',
+    },
 }));
 app.use(passport.initialize());
 app.use(passport.session());
@@ -69,26 +97,33 @@ function isCaloiro(email) {
 }
 
 // ─── Rotas Web ────────────────────────────────────────────────────────────────
+
+// Inicia o fluxo OAuth2 — gera um token e passa-o como state
 app.get('/auth/microsoft', (req, res, next) => {
     if (!req.query.discordId) {
         return res.status(400).send('❌ Pedido inválido: falta o ID do Discord.');
     }
-    req.session.discordId = req.query.discordId;
-    passport.authenticate('microsoft')(req, res, next);
+    const token = createToken(req.query.discordId);
+    // O token é passado como state através do fluxo OAuth2
+    // Não depende de sessão — é recuperado no callback via req.query.state
+    passport.authenticate('microsoft', { state: token })(req, res, next);
 });
 
+// Callback da Microsoft após login
 app.get(
     '/auth/microsoft/callback',
     passport.authenticate('microsoft', { failureRedirect: '/auth/failed' }),
     async (req, res) => {
         const userEmail = req.user.email;
-        const discordId = req.session.discordId;
+        // Recuperar discordId a partir do token no state (sem usar sessão)
+        const token = req.query.state;
+        const discordId = consumeToken(token);
 
         if (!userEmail) {
             return res.status(400).send('❌ Não foi possível obter o email da tua conta Microsoft.');
         }
         if (!discordId) {
-            return res.status(400).send('❌ Sessão inválida. Clica de novo no botão no Discord.');
+            return res.status(400).send('❌ Link expirado ou inválido. Clica de novo no botão no Discord.');
         }
         if (!isCaloiro(userEmail)) {
             return res.status(403).send(
@@ -117,7 +152,6 @@ app.get('/auth/failed', (_req, res) => {
 discordClient.once('clientReady', async (client) => {
     console.log(`🤖 Bot ligado como ${client.user.tag}`);
 
-    // Registar slash command /painel
     const commands = [
         new SlashCommandBuilder()
             .setName('painel')
@@ -157,7 +191,6 @@ discordClient.on('interactionCreate', async (interaction) => {
             .setStyle(ButtonStyle.Primary);
 
         const row = new ActionRowBuilder().addComponents(button);
-
         await interaction.reply({ embeds: [embed], components: [row] });
         return;
     }
@@ -165,7 +198,6 @@ discordClient.on('interactionCreate', async (interaction) => {
     // ── Clique no botão de verificação ──
     if (interaction.isButton() && interaction.customId === 'iniciar_verificacao') {
         const link = `${BASE_URL}/auth/microsoft?discordId=${interaction.user.id}`;
-
         await interaction.reply({
             content:
                 `🔗 **Clica no link abaixo** para fazeres login com a tua conta institucional da ESTG:\n${link}\n\n` +
