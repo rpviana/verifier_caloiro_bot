@@ -1,5 +1,16 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits } = require('discord.js');
+const {
+    Client,
+    GatewayIntentBits,
+    SlashCommandBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    EmbedBuilder,
+    REST,
+    Routes,
+    PermissionFlagsBits,
+} = require('discord.js');
 const express = require('express');
 const passport = require('passport');
 const MicrosoftStrategy = require('passport-microsoft').Strategy;
@@ -37,10 +48,7 @@ passport.use(new MicrosoftStrategy(
         scope: ['user.read'],
     },
     async (_accessToken, _refreshToken, profile, done) => {
-        const email =
-            profile.emails && profile.emails[0]
-                ? profile.emails[0].value
-                : null;
+        const email = profile.emails?.[0]?.value ?? null;
         return done(null, { email });
     },
 ));
@@ -49,16 +57,13 @@ passport.serializeUser((user, done) => done(null, user));
 passport.deserializeUser((user, done) => done(null, user));
 
 // ─── Validação de Caloiro ─────────────────────────────────────────────────────
-// Formato esperado: 826XXXX@estg.ipp.pt  (ano 2026, 4 dígitos de número)
+// Formato: 826XXXX@estg.ipp.pt
 const CALOIRO_REGEX = /^826\d{4}@estg\.ipp\.pt$/i;
-
 function isCaloiro(email) {
     return email && CALOIRO_REGEX.test(email);
 }
 
 // ─── Rotas Web ────────────────────────────────────────────────────────────────
-
-// Inicia o fluxo OAuth2 — recebe o discordId como query param
 app.get('/auth/microsoft', (req, res, next) => {
     if (!req.query.discordId) {
         return res.status(400).send('❌ Pedido inválido: falta o ID do Discord.');
@@ -67,7 +72,6 @@ app.get('/auth/microsoft', (req, res, next) => {
     passport.authenticate('microsoft')(req, res, next);
 });
 
-// Callback da Microsoft após login
 app.get(
     '/auth/microsoft/callback',
     passport.authenticate('microsoft', { failureRedirect: '/auth/failed' }),
@@ -76,87 +80,98 @@ app.get(
         const discordId = req.session.discordId;
 
         if (!userEmail) {
-            return res.status(400).send(
-                '❌ Não foi possível obter o email da tua conta Microsoft.',
-            );
+            return res.status(400).send('❌ Não foi possível obter o email da tua conta Microsoft.');
         }
-
         if (!discordId) {
-            return res.status(400).send(
-                '❌ Sessão inválida: ID do Discord em falta. Clica de novo no link do bot.',
-            );
+            return res.status(400).send('❌ Sessão inválida. Clica de novo no botão no Discord.');
         }
-
         if (!isCaloiro(userEmail)) {
             return res.status(403).send(
-                `❌ Verificação falhou: o email <b>${userEmail}</b> não pertence a um caloiro de 2026 válido.`,
+                `❌ Verificação falhou: o email <b>${userEmail}</b> não pertence a um caloiro de 2026 válido.`
             );
         }
 
         try {
-            const guild = await discordClient.guilds.fetch(
-                process.env.DISCORD_GUILD_ID,
-            );
+            const guild = await discordClient.guilds.fetch(process.env.DISCORD_GUILD_ID);
             const member = await guild.members.fetch(discordId);
             await member.roles.add(process.env.ROLE_ID);
-
-            console.log(
-                `✅ Cargo atribuído ao membro ${discordId} (${userEmail})`,
-            );
-            return res.send(
-                '🎉 Conta verificada com sucesso! Podes fechar esta janela e voltar ao Discord.',
-            );
+            console.log(`✅ Cargo atribuído: ${discordId} (${userEmail})`);
+            return res.send('🎉 Conta verificada com sucesso! Podes fechar esta janela e voltar ao Discord.');
         } catch (error) {
             console.error('Erro ao atribuir cargo:', error);
-            return res.status(500).send(
-                '⚠️ Ocorreu um erro ao atribuir o cargo no Discord. Contacta um administrador.',
-            );
+            return res.status(500).send('⚠️ Erro ao atribuir o cargo. Contacta um administrador.');
         }
-    },
+    }
 );
 
-// Rota de erro de autenticação
 app.get('/auth/failed', (_req, res) => {
-    res.status(401).send(
-        '❌ Autenticação com a Microsoft falhou. Tenta novamente ou contacta um administrador.',
-    );
+    res.status(401).send('❌ Autenticação com a Microsoft falhou. Tenta novamente.');
 });
 
-// ─── Eventos do Bot Discord ───────────────────────────────────────────────────
+// ─── Bot Discord ──────────────────────────────────────────────────────────────
+discordClient.once('clientReady', async (client) => {
+    console.log(`🤖 Bot ligado como ${client.user.tag}`);
 
-discordClient.once('ready', () => {
-    console.log(`🤖 Bot ligado como ${discordClient.user.tag}`);
+    // Registar slash command /painel
+    const commands = [
+        new SlashCommandBuilder()
+            .setName('painel')
+            .setDescription('Envia o painel de verificação de caloiros (só administradores)')
+            .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+            .toJSON(),
+    ];
+
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    try {
+        await rest.put(
+            Routes.applicationGuildCommands(client.user.id, process.env.DISCORD_GUILD_ID),
+            { body: commands }
+        );
+        console.log('✅ Slash command /painel registado');
+    } catch (err) {
+        console.error('Erro ao registar slash commands:', err);
+    }
 });
 
-// Comando !verificar — pode ser usado por qualquer membro (gera o link para ele próprio)
-// Só administradores podem usar !verificar @utilizador para verificar outra pessoa
-discordClient.on('messageCreate', async (message) => {
-    // Ignora mensagens de bots
-    if (message.author.bot) return;
+discordClient.on('interactionCreate', async (interaction) => {
+    // ── Slash command /painel (apenas admins) ──
+    if (interaction.isChatInputCommand() && interaction.commandName === 'painel') {
+        const embed = new EmbedBuilder()
+            .setTitle('🎓 Verificação de Caloiro — ESTG·IPP')
+            .setDescription(
+                'Bem-vindo ao servidor!\n\n' +
+                'Para obteres o cargo de **Caloiro**, clica no botão abaixo e faz login com a tua conta institucional `@estg.ipp.pt`.\n\n' +
+                '> A verificação é automática e segura. O teu cargo será atribuído imediatamente após o login.'
+            )
+            .setColor(0x5865F2)
+            .setFooter({ text: 'Apenas contas 826XXXX@estg.ipp.pt são aceites.' });
 
-    if (message.content === '!verificar') {
-        const targetId = message.author.id;
-        const link = `${BASE_URL}/auth/microsoft?discordId=${targetId}`;
+        const button = new ButtonBuilder()
+            .setCustomId('iniciar_verificacao')
+            .setLabel('✅  Verificar como Caloiro')
+            .setStyle(ButtonStyle.Primary);
 
-        try {
-            // Envia o link em DM para não expor o ID no canal
-            await message.author.send(
-                `🔗 Clica no link abaixo para verificares o teu estatuto de caloiro com a tua conta institucional da ESTG:\n${link}\n\n⚠️ Este link é pessoal — não o partilhes com ninguém!`,
-            );
-            await message.reply(
-                '📩 Enviei-te um DM com o link de verificação!',
-            );
-        } catch {
-            // Se as DMs estão fechadas, envia no canal (menos seguro)
-            await message.reply(
-                `🔗 Clica aqui para verificares: ${link}\n⚠️ Este link é pessoal — não o partilhes!`,
-            );
-        }
+        const row = new ActionRowBuilder().addComponents(button);
+
+        await interaction.reply({ embeds: [embed], components: [row] });
+        return;
+    }
+
+    // ── Clique no botão de verificação ──
+    if (interaction.isButton() && interaction.customId === 'iniciar_verificacao') {
+        const link = `${BASE_URL}/auth/microsoft?discordId=${interaction.user.id}`;
+
+        await interaction.reply({
+            content:
+                `🔗 **Clica no link abaixo** para fazeres login com a tua conta institucional da ESTG:\n${link}\n\n` +
+                `⚠️ Este link é pessoal — não o partilhes com ninguém!`,
+            ephemeral: true, // Só o utilizador que clicou vê esta mensagem
+        });
+        return;
     }
 });
 
 // ─── Arranque ─────────────────────────────────────────────────────────────────
-
 app.listen(PORT, () => {
     console.log(`🌐 Servidor web ativo em ${BASE_URL} (porta ${PORT})`);
 });
